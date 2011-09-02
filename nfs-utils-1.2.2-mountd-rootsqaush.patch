@@ -1,0 +1,33 @@
+commit 6d86c6b9f1b2001bc215236e558689b5d6434ee7
+Author: Steve Dickson <steved@redhat.com>
+Date:   Wed Jun 2 16:50:34 2010 -0400
+
+    rpc.mountd: Turn off root_squash on pseudo roots, its not needed.
+    
+    Currently the default setting of a pseudo root is to have
+    NFSEXP_ROOTSQUASH enabled. This setting will cause the looking
+    up of real export to fail when have the no_root_squash set.
+    
+    It turns the setting of NFSEXP_ROOTSQUASH is not needed on pseudo
+    roots for two reasons. 1) pseudo roots are marked as read-only so
+    they can not be written on. 2) pseudo roots only show exported
+    entries when they are mounted.
+    
+    Signed-off-by: Steve Dickson <steved@redhat.com>
+
+diff --git a/utils/mountd/v4root.c b/utils/mountd/v4root.c
+index 7fd6af3..41b77eb 100644
+--- a/utils/mountd/v4root.c
++++ b/utils/mountd/v4root.c
+@@ -35,9 +35,8 @@ static nfs_export pseudo_root = {
+ 	.m_export = {
+ 		.e_hostname = "*",
+ 		.e_path = "/",
+-		.e_flags = NFSEXP_READONLY | NFSEXP_ROOTSQUASH
+-				| NFSEXP_NOSUBTREECHECK | NFSEXP_FSID
+-				| NFSEXP_V4ROOT,
++		.e_flags = NFSEXP_READONLY | NFSEXP_NOSUBTREECHECK | 
++				NFSEXP_FSID | NFSEXP_V4ROOT,
+ 		.e_anonuid = 65534,
+ 		.e_anongid = 65534,
+ 		.e_squids = NULL,

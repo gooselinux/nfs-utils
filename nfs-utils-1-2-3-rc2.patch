@@ -1,0 +1,1216 @@
+diff --git a/configure.ac b/configure.ac
+index 518b6d8..d90a88f 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -425,6 +425,8 @@ AC_CONFIG_FILES([
+ 	tools/nlmtest/Makefile
+ 	tools/rpcdebug/Makefile
+ 	tools/rpcgen/Makefile
++	tools/mountstats/Makefile
++	tools/nfs-iostat/Makefile
+ 	utils/Makefile
+ 	utils/exportfs/Makefile
+ 	utils/gssd/Makefile
+diff --git a/support/export/client.c b/support/export/client.c
+index 5e937b0..6a25928 100644
+--- a/support/export/client.c
++++ b/support/export/client.c
+@@ -32,11 +32,26 @@ extern int	innetgr(char *netgr, char *host, char *, char *);
+ static char	*add_name(char *old, const char *add);
+ static void	client_init(nfs_client *clp, const char *hname,
+ 					struct hostent *hp);
+-static int	client_checkaddr(nfs_client *clp, struct in_addr addr);
+ 
+ nfs_client	*clientlist[MCL_MAXTYPES] = { NULL, };
+ 
+ 
++static void
++init_addrlist(nfs_client *clp, const struct hostent *hp)
++{
++	char **ap;
++	int i;
++
++	if (hp == NULL)
++		return;
++
++	ap = hp->h_addr_list;
++	for (i = 0; *ap != NULL && i < NFSCLNT_ADDRMAX; i++, ap++)
++		clp->m_addrlist[i] = *(struct in_addr *)*ap;
++
++	clp->m_naddr = i;
++}
++
+ /* if canonical is set, then we *know* this is already a canonical name
+  * so hostname lookup is avoided.
+  * This is used when reading /proc/fs/nfs/exports
+@@ -97,14 +112,8 @@ client_lookup(char *hname, int canonical)
+ 		client_add(clp);
+ 	}
+ 
+-	if (htype == MCL_FQDN && clp->m_naddr == 0 && hp != NULL) {
+-		char	**ap = hp->h_addr_list;
+-		int	i;
+-
+-		for (i = 0; *ap && i < NFSCLNT_ADDRMAX; i++, ap++)
+-			clp->m_addrlist[i] = *(struct in_addr *)*ap;
+-		clp->m_naddr = i;
+-	}
++	if (htype == MCL_FQDN && clp->m_naddr == 0)
++		init_addrlist(clp, hp);
+ 
+ 	if (hp)
+ 		free (hp);
+@@ -138,6 +147,7 @@ client_init(nfs_client *clp, const char *hname, struct hostent *hp)
+ 
+ 	clp->m_exported = 0;
+ 	clp->m_count = 0;
++	clp->m_naddr = 0;
+ 
+ 	if (clp->m_type == MCL_SUBNETWORK) {
+ 		char	*cp = strchr(clp->m_hostname, '/');
+@@ -161,18 +171,10 @@ client_init(nfs_client *clp, const char *hname, struct hostent *hp)
+ 			}
+ 		}
+ 		*cp = '/';
+-		clp->m_naddr = 0;
+-	} else if (!hp) {
+-		clp->m_naddr = 0;
+-	} else {
+-		char	**ap = hp->h_addr_list;
+-		int	i;
+-
+-		for (i = 0; *ap && i < NFSCLNT_ADDRMAX; i++, ap++) {
+-			clp->m_addrlist[i] = *(struct in_addr *)*ap;
+-		}
+-		clp->m_naddr = i;
++		return;
+ 	}
++	
++	init_addrlist(clp, hp);
+ }
+ 
+ void
+@@ -329,101 +331,158 @@ add_name(char *old, const char *add)
+ }
+ 
+ /*
+- * Match a host (given its hostent record) to a client record. This
+- * is usually called from mountd.
++ * Check each address listed in @hp against each address
++ * stored in @clp.  Return 1 if a match is found, otherwise
++ * zero.
+  */
+-int
+-client_check(nfs_client *clp, struct hostent *hp)
++static int
++check_fqdn(const nfs_client *clp, const struct hostent *hp)
+ {
+-	char	*hname = (char *) hp->h_name;
+-	char	*cname = clp->m_hostname;
+-	char	**ap;
++	struct in_addr addr;
++	char **ap;
++	int i;
+ 
+-	switch (clp->m_type) {
+-	case MCL_FQDN:
+-	case MCL_SUBNETWORK:
+-		for (ap = hp->h_addr_list; *ap; ap++) {
+-			if (client_checkaddr(clp, *(struct in_addr *) *ap))
+-				return 1;
+-		}
+-		return 0;
+-	case MCL_WILDCARD:
+-		if (wildmat(hname, cname))
+-			return 1;
+-		else {
+-			for (ap = hp->h_aliases; *ap; ap++)
+-				if (wildmat(*ap, cname))
+-					return 1;
+-		}
+-		return 0;
+-	case MCL_NETGROUP:
+-#ifdef HAVE_INNETGR
+-		{
+-			char	*dot;
+-			int	match, i;
+-			struct hostent *nhp = NULL;
+-			struct sockaddr_in addr;
+-
+-			/* First, try to match the hostname without
+-			 * splitting off the domain */
+-			if (innetgr(cname+1, hname, NULL, NULL))
++	for (ap = hp->h_addr_list; *ap; ap++) {
++		addr = *(struct in_addr *)*ap;
++
++		for (i = 0; i < clp->m_naddr; i++)
++			if (clp->m_addrlist[i].s_addr == addr.s_addr)
+ 				return 1;
++	}
++	return 0;
++}
+ 
+-			/* try the aliases as well */
+-			for (i = 0; hp->h_aliases[i]; i++) {
+-				if (innetgr(cname+1, hp->h_aliases[i], NULL, NULL))
+-					return 1;
+-			}
++/*
++ * Check each address listed in @hp against the subnetwork or
++ * host address stored in @clp.  Return 1 if an address in @hp
++ * matches the host address stored in @clp, otherwise zero.
++ */
++static int
++check_subnetwork(const nfs_client *clp, const struct hostent *hp)
++{
++	struct in_addr addr;
++	char **ap;
+ 
+-			/* If hname is ip address convert to FQDN */
+-			if (inet_aton(hname, &addr.sin_addr) &&
+-			   (nhp = gethostbyaddr((const char *)&(addr.sin_addr),
+-			    sizeof(addr.sin_addr), AF_INET))) {
+-				hname = (char *)nhp->h_name;
+-				if (innetgr(cname+1, hname, NULL, NULL))
+-					return 1;
+-			}
++	for (ap = hp->h_addr_list; *ap; ap++) {
++		addr = *(struct in_addr *)*ap;
+ 
+-			/* Okay, strip off the domain (if we have one) */
+-			if ((dot = strchr(hname, '.')) == NULL)
+-				return 0;
++		if (!((clp->m_addrlist[0].s_addr ^ addr.s_addr) &
++		      clp->m_addrlist[1].s_addr))
++			return 1;
++	}
++	return 0;
++}
+ 
+-			*dot = '\0';
+-			match = innetgr(cname+1, hname, NULL, NULL);
+-			*dot = '.';
++/*
++ * Check if a wildcard nfs_client record matches the canonical name
++ * or the aliases of a host.  Return 1 if a match is found, otherwise
++ * zero.
++ */
++static int
++check_wildcard(const nfs_client *clp, const struct hostent *hp)
++{
++	char *cname = clp->m_hostname;
++	char *hname = hp->h_name;
++	char **ap;
+ 
+-			return match;
+-		}
+-#else
+-		return 0;
+-#endif
+-	case MCL_ANONYMOUS:
++	if (wildmat(hname, cname))
+ 		return 1;
+-	case MCL_GSS:
+-		return 0;
+-	default:
+-		xlog(L_FATAL, "internal: bad client type %d", clp->m_type);
++
++	/* See if hname aliases listed in /etc/hosts or nis[+]
++	 * match the requested wildcard */
++	for (ap = hp->h_aliases; *ap; ap++) {
++		if (wildmat(*ap, cname))
++			return 1;
+ 	}
+ 
+ 	return 0;
+ }
+ 
++/*
++ * Check if @hp's hostname or aliases fall in a given netgroup.
++ * Return 1 if @hp represents a host in the netgroup, otherwise zero.
++ */
++#ifdef HAVE_INNETGR
++static int
++check_netgroup(const nfs_client *clp, const struct hostent *hp)
++{
++	const char *netgroup = clp->m_hostname + 1;
++	const char *hname = hp->h_name;
++	struct hostent *nhp = NULL;
++	struct sockaddr_in addr;
++	int match, i;
++	char *dot;
++
++	/* First, try to match the hostname without
++	 * splitting off the domain */
++	if (innetgr(netgroup, hname, NULL, NULL))
++		return 1;
++
++	/* See if hname aliases listed in /etc/hosts or nis[+]
++	 * match the requested netgroup */
++	for (i = 0; hp->h_aliases[i]; i++) {
++		if (innetgr(netgroup, hp->h_aliases[i], NULL, NULL))
++			return 1;
++	}
++
++	/* If hname is ip address convert to FQDN */
++	if (inet_aton(hname, &addr.sin_addr) &&
++	   (nhp = gethostbyaddr((const char *)&(addr.sin_addr),
++	    sizeof(addr.sin_addr), AF_INET))) {
++		hname = nhp->h_name;
++		if (innetgr(netgroup, hname, NULL, NULL))
++			return 1;
++	}
++
++	/* Okay, strip off the domain (if we have one) */
++	dot = strchr(hname, '.');
++	if (dot == NULL)
++		return 0;
++
++	*dot = '\0';
++	match = innetgr(netgroup, hname, NULL, NULL);
++	*dot = '.';
++
++	return match;
++}
++#else	/* !HAVE_INNETGR */
+ static int
+-client_checkaddr(nfs_client *clp, struct in_addr addr)
++check_netgroup(__attribute__((unused)) const nfs_client *clp,
++		__attribute__((unused)) const struct hostent *hp)
+ {
+-	int	i;
++	return 0;
++}
++#endif	/* !HAVE_INNETGR */
+ 
++/**
++ * client_check - check if IP address information matches a cached nfs_client
++ * @clp: pointer to a cached nfs_client record
++ * @hp: pointer to hostent containing host IP information
++ *
++ * Returns 1 if the address information matches the cached nfs_client,
++ * otherwise zero.
++ */
++int
++client_check(nfs_client *clp, struct hostent *hp)
++{
+ 	switch (clp->m_type) {
+ 	case MCL_FQDN:
+-		for (i = 0; i < clp->m_naddr; i++) {
+-			if (clp->m_addrlist[i].s_addr == addr.s_addr)
+-				return 1;
+-		}
+-		return 0;
++		return check_fqdn(clp, hp);
+ 	case MCL_SUBNETWORK:
+-		return !((clp->m_addrlist[0].s_addr ^ addr.s_addr)
+-			& clp->m_addrlist[1].s_addr);
++		return check_subnetwork(clp, hp);
++	case MCL_WILDCARD:
++		return check_wildcard(clp, hp);
++	case MCL_NETGROUP:
++		return check_netgroup(clp, hp);
++	case MCL_ANONYMOUS:
++		return 1;
++	case MCL_GSS:
++		return 0;
++	default:
++		xlog(D_GENERAL, "%s: unrecognized client type: %d",
++				__func__, clp->m_type);
+ 	}
++
+ 	return 0;
+ }
+ 
+diff --git a/support/export/export.c b/support/export/export.c
+index 42e78f6..3e4da69 100644
+--- a/support/export/export.c
++++ b/support/export/export.c
+@@ -28,6 +28,18 @@ static int	export_check(nfs_export *, struct hostent *, char *);
+ static nfs_export *
+ 		export_allowed_internal(struct hostent *hp, char *path);
+ 
++static void
++export_free(nfs_export *exp)
++{
++	xfree(exp->m_export.e_squids);
++	xfree(exp->m_export.e_sqgids);
++	free(exp->m_export.e_mountpoint);
++	free(exp->m_export.e_fslocdata);
++
++	xfree(exp->m_export.e_hostname);
++	xfree(exp);
++}
++
+ static void warn_duplicated_exports(nfs_export *exp, struct exportent *eep)
+ {
+ 	if (exp->m_export.e_flags != eep->e_flags) {
+@@ -117,6 +129,10 @@ export_dup(nfs_export *exp, struct hostent *hp)
+ 	if (exp->m_export.e_hostname)
+ 		new->m_export.e_hostname = xstrdup(exp->m_export.e_hostname);
+ 	clp = client_dup(exp->m_client, hp);
++	if (clp == NULL) {
++		export_free(new);
++		return NULL;
++	}
+ 	clp->m_count++;
+ 	new->m_client = clp;
+ 	new->m_mayexport = exp->m_mayexport;
+@@ -260,6 +276,10 @@ export_check(nfs_export *exp, struct hostent *hp, char *path)
+ 	return client_check(exp->m_client, hp);
+ }
+ 
++/**
++ * export_freeall - deallocate all nfs_export records
++ *
++ */
+ void
+ export_freeall(void)
+ {
+@@ -270,16 +290,7 @@ export_freeall(void)
+ 		for (exp = exportlist[i].p_head; exp; exp = nxt) {
+ 			nxt = exp->m_next;
+ 			client_release(exp->m_client);
+-			if (exp->m_export.e_squids)
+-				xfree(exp->m_export.e_squids);
+-			if (exp->m_export.e_sqgids)
+-				xfree(exp->m_export.e_sqgids);
+-			if (exp->m_export.e_mountpoint)
+-				free(exp->m_export.e_mountpoint);
+-			if (exp->m_export.e_fslocdata)
+-				free(exp->m_export.e_fslocdata);
+-			xfree(exp->m_export.e_hostname);
+-			xfree(exp);
++			export_free(exp);
+ 		}
+ 		for (j = 0; j < HASH_TABLE_SIZE; j++) {
+ 			exportlist[i].entries[j].p_first = NULL;
+diff --git a/support/include/nfslib.h b/support/include/nfslib.h
+index 537a31e..e44cf8f 100644
+--- a/support/include/nfslib.h
++++ b/support/include/nfslib.h
+@@ -152,6 +152,8 @@ void qword_addhex(char **bpp, int *lp, char *buf, int blen);
+ void qword_addint(char **bpp, int *lp, int n);
+ void qword_adduint(char **bpp, int *lp, unsigned int n);
+ void qword_addeol(char **bpp, int *lp);
++int qword_get_uint(char **bpp, unsigned int *anint);
++void qword_printuint(FILE *f, unsigned int num);
+ 
+ void closeall(int min);
+ 
+diff --git a/support/nfs/cacheio.c b/support/nfs/cacheio.c
+index 0587ecb..55fa45d 100644
+--- a/support/nfs/cacheio.c
++++ b/support/nfs/cacheio.c
+@@ -241,7 +241,7 @@ int qword_get_int(char **bpp, int *anint)
+ 	return 0;
+ }
+ 
+-int qword_get_uint(char *bpp, unsigned int *anint)
++int qword_get_uint(char **bpp, unsigned int *anint)
+ {
+ 	char buf[50];
+ 	char *ep;
+diff --git a/tests/t0001-statd-basic-mon-unmon.sh b/tests/t0001-statd-basic-mon-unmon.sh
+old mode 100644
+new mode 100755
+diff --git a/tools/Makefile.am b/tools/Makefile.am
+index db15346..f2ce282 100644
+--- a/tools/Makefile.am
++++ b/tools/Makefile.am
+@@ -6,6 +6,6 @@ if CONFIG_RPCGEN
+ OPTDIRS += rpcgen
+ endif
+ 
+-SUBDIRS = locktest rpcdebug nlmtest $(OPTDIRS)
++SUBDIRS = locktest rpcdebug nlmtest mountstats nfs-iostat $(OPTDIRS)
+ 
+ MAINTAINERCLEANFILES = Makefile.in
+diff --git a/tools/mountstats/Makefile.am b/tools/mountstats/Makefile.am
+new file mode 100644
+index 0000000..ca617a2
+--- /dev/null
++++ b/tools/mountstats/Makefile.am
+@@ -0,0 +1,13 @@
++## Process this file with automake to produce Makefile.in
++PYTHON_FILES =  mountstats.py
++
++man8_MANS	= mountstats.man
++
++EXTRA_DIST	= $(man8_MANS) $(PYTHON_FILES)
++
++all-local: $(PYTHON_FILES)
++
++install-data-hook:
++	$(INSTALL) --mode 755 mountstats.py $(DESTDIR)$(sbindir)/mountstats
++
++MAINTAINERCLEANFILES=Makefile.in
+diff --git a/tools/mountstats/mountstats.man b/tools/mountstats/mountstats.man
+new file mode 100644
+index 0000000..0de31b7
+--- /dev/null
++++ b/tools/mountstats/mountstats.man
+@@ -0,0 +1,32 @@
++.\"
++.\" mountstats(8)
++.\"
++.TH mountstats 8 "15 Apr 2010"
++.SH NAME
++mountstats \- Displays NFS client per-mount statistics
++.SH SYNOPSIS
++.BI "mountstats ["<options> "] " <mount_point> " [ " <mount_point> "]" 
++.SH DESCRIPTION
++The
++.B mountstats
++command displays NFS client statisitics on each given
++.I <mount_point>
++.SH OPTIONS
++.TP
++.B " \-\-nfs
++display only the NFS statistics
++.TP
++.B " \-\-rpc 
++display only the RPC statistics
++.TP
++.B " \-\-version 
++display the version of this command
++.SH FILES
++.TP
++.B /proc/self/mountstats
++.SH SEE ALSO
++.BR iostat (8),
++.BR nfsiostat (8),
++.BR nfsstat(8)
++.SH AUTHOR
++Chuck Lever <chuck.lever@oracle.com>
+diff --git a/tools/nfs-iostat/Makefile.am b/tools/nfs-iostat/Makefile.am
+new file mode 100644
+index 0000000..30f4054
+--- /dev/null
++++ b/tools/nfs-iostat/Makefile.am
+@@ -0,0 +1,13 @@
++## Process this file with automake to produce Makefile.in
++PYTHON_FILES =  nfs-iostat.py
++
++man8_MANS	= nfsiostat.man
++
++EXTRA_DIST	= $(man8_MANS) $(PYTHON_FILES)
++
++all-local: $(PYTHON_FILES)
++
++install-data-hook:
++	$(INSTALL) --mode 755 nfs-iostat.py $(DESTDIR)$(sbindir)/nfsiostat
++
++MAINTAINERCLEANFILES=Makefile.in
+diff --git a/tools/nfs-iostat/nfsiostat.man b/tools/nfs-iostat/nfsiostat.man
+new file mode 100644
+index 0000000..7b1e0a8
+--- /dev/null
++++ b/tools/nfs-iostat/nfsiostat.man
+@@ -0,0 +1,70 @@
++.\"
++.\" nfsiostat(8)
++.\"
++.TH nfsiostat 8 "15 Apr 2010"
++.SH NAME
++nfsiostat \- Emulate iostat for NFS mount points using /proc/self/mountstats
++.SH SYNOPSIS
++.BI "nfsiostat [[" <interval> "] [" <count> "]] [" <options> "]["<mount_point> "]
++.SH DESCRIPTION
++The
++.B nfsiostat
++command displays NFS client per-mount statisitics. 
++.TP 
++<interval>
++specifies the amount of time in seconds between each report.
++The first report contains statistics for the time since each file
++system was mounted.  Each subsequent report contains statistics collected
++during the interval since the previous report.
++.TP
++<count>
++If the
++.I <count>
++parameter is
++specified, the value of 
++.I <count> 
++determines the number of reports generated at
++. <interval> 
++seconds apart. if the interval parameter is 
++specified without the
++.I <count> 
++parameter, the command generates reports continuously.
++.TP
++<options>
++Define below
++.TP
++<mount_point>
++If one or more
++.I <mount point> 
++names are specified, statistics for only these mount points will
++be displayed.  Otherwise, all NFS mount points on the client are listed.
++.SH OPTIONS
++.TP
++.B \-a " or " \-\-attr
++displays statistics related to the attribute cache
++.TP
++.B \-d " or " \-\-dir 
++displays statistics related to directory operations
++.TP
++.B \-h " or " \-\-help 
++shows help message and exit
++.TP
++.B \-l LIST or " \-\-list=LIST 
++only print stats for first LIST mount points
++.TP
++.B \-p " or " \-\-page
++displays statistics related to the page cache
++.TP
++.B \-s " or " \-\-sort
++Sort NFS mount points by ops/second
++.B \-\-version
++show program's version number and exit
++.SH FILES
++.TP
++.B /proc/self/mountstats
++.SH SEE ALSO
++.BR iostat (8),
++.BR mountstats (8),
++.BR nfsstat(8)
++.SH AUTHOR
++Chuck Lever <chuck.lever@oracle.com>
+diff --git a/utils/gssd/context.h b/utils/gssd/context.h
+index be47f9c..c9cb0bd 100644
+--- a/utils/gssd/context.h
++++ b/utils/gssd/context.h
+@@ -1,5 +1,5 @@
+ /*
+-  Copyright (c) 2004 The Regents of the University of Michigan.
++  Copyright (c) 2004,2008 The Regents of the University of Michigan.
+   All rights reserved.
+ 
+   Redistribution and use in source and binary forms, with or without
+@@ -36,6 +36,10 @@
+ /* Hopefully big enough to hold any serialized context */
+ #define MAX_CTX_LEN 4096
+ 
++/* New context format flag values */
++#define KRB5_CTX_FLAG_INITIATOR         0x00000001
++#define KRB5_CTX_FLAG_CFX               0x00000002
++#define KRB5_CTX_FLAG_ACCEPTOR_SUBKEY   0x00000004
+ 
+ int serialize_context_for_kernel(gss_ctx_id_t ctx, gss_buffer_desc *buf,
+ 				 gss_OID mech, int32_t *endtime);
+diff --git a/utils/gssd/context_lucid.c b/utils/gssd/context_lucid.c
+index 4a682ae..b87bf76 100644
+--- a/utils/gssd/context_lucid.c
++++ b/utils/gssd/context_lucid.c
+@@ -42,6 +42,7 @@
+ #include <stdio.h>
+ #include <syslog.h>
+ #include <string.h>
++#include <errno.h>
+ 
+ #include <gssapi/gssapi_krb5.h>
+ 
+@@ -119,15 +120,13 @@ prepare_krb5_rfc1964_buffer(gss_krb5_lucid_context_v1_t *lctx,
+ 	 * Note that the rfc1964 version only supports DES enctypes.
+ 	 */
+ 	if (lctx->rfc1964_kd.ctx_key.type != 4) {
+-		printerr(1, "prepare_krb5_rfc1964_buffer: "
+-			    "overriding heimdal keytype (%d => %d)\n",
+-			    lctx->rfc1964_kd.ctx_key.type, 4);
++		printerr(2, "%s: overriding heimdal keytype (%d => %d)\n",
++			 __FUNCTION__, lctx->rfc1964_kd.ctx_key.type, 4);
+ 		lctx->rfc1964_kd.ctx_key.type = 4;
+ 	}
+ #endif
+-	printerr(2, "prepare_krb5_rfc1964_buffer: serializing keys with "
+-		 "enctype %d and length %d\n",
+-		 lctx->rfc1964_kd.ctx_key.type,
++	printerr(2, "%s: serializing keys with enctype %d and length %d\n",
++		 __FUNCTION__, lctx->rfc1964_kd.ctx_key.type,
+ 		 lctx->rfc1964_kd.ctx_key.length);
+ 
+ 	/* derive the encryption key and copy it into buffer */
+@@ -158,11 +157,100 @@ out_err:
+ 	return -1;
+ }
+ 
++/* Flags for version 2 context flags */
++#define KRB5_CTX_FLAG_INITIATOR		0x00000001
++#define KRB5_CTX_FLAG_CFX		0x00000002
++#define KRB5_CTX_FLAG_ACCEPTOR_SUBKEY	0x00000004
++
++/*
++ * Prepare a new-style buffer, as defined in rfc4121 (a.k.a. cfx),
++ * to send to the kernel for newer encryption types -- or for DES3.
++ *
++ * The new format is:
++ *
++ *	u32 flags;
++ *	#define KRB5_CTX_FLAG_INITIATOR		0x00000001
++ *	#define KRB5_CTX_FLAG_CFX		0x00000002
++ *	#define KRB5_CTX_FLAG_ACCEPTOR_SUBKEY	0x00000004
++ *	s32 endtime;
++ *	u64 seq_send;
++ *	u32  enctype;			( encrption type of key )
++ *	raw key;			( raw key bytes (kernel will derive))
++ *
++ */
+ static int
+-prepare_krb5_rfc_cfx_buffer(gss_krb5_lucid_context_v1_t *lctx,
++prepare_krb5_rfc4121_buffer(gss_krb5_lucid_context_v1_t *lctx,
+ 	gss_buffer_desc *buf, int32_t *endtime)
+ {
+-	printerr(0, "ERROR: prepare_krb5_rfc_cfx_buffer: not implemented\n");
++	char *p, *end;
++	uint32_t v2_flags = 0;
++	uint32_t enctype;
++	uint32_t keysize;
++
++	if (!(buf->value = calloc(1, MAX_CTX_LEN)))
++		goto out_err;
++	p = buf->value;
++	end = buf->value + MAX_CTX_LEN;
++
++	/* Version 2 */
++	if (lctx->initiate)
++		v2_flags |= KRB5_CTX_FLAG_INITIATOR;
++	if (lctx->protocol != 0)
++		v2_flags |= KRB5_CTX_FLAG_CFX;
++	if (lctx->protocol != 0 && lctx->cfx_kd.have_acceptor_subkey == 1)
++		v2_flags |= KRB5_CTX_FLAG_ACCEPTOR_SUBKEY;
++
++	if (WRITE_BYTES(&p, end, v2_flags)) goto out_err;
++	if (WRITE_BYTES(&p, end, lctx->endtime)) goto out_err;
++	if (WRITE_BYTES(&p, end, lctx->send_seq)) goto out_err;
++
++	/* Protocol 0 here implies DES3 or RC4 */
++	printerr(2, "%s: protocol %d\n", __FUNCTION__, lctx->protocol);
++	if (lctx->protocol == 0) {
++		enctype = lctx->rfc1964_kd.ctx_key.type;
++		keysize = lctx->rfc1964_kd.ctx_key.length;
++	} else {
++		if (lctx->cfx_kd.have_acceptor_subkey) {
++			enctype = lctx->cfx_kd.acceptor_subkey.type;
++			keysize = lctx->cfx_kd.acceptor_subkey.length;
++		} else {
++			enctype = lctx->cfx_kd.ctx_key.type;
++			keysize = lctx->cfx_kd.ctx_key.length;
++		}
++	}
++	printerr(2, "%s: serializing key with enctype %d and size %d\n",
++		 __FUNCTION__, enctype, keysize);
++
++	if (WRITE_BYTES(&p, end, enctype)) goto out_err;
++
++	if (lctx->protocol == 0) {
++		if (write_bytes(&p, end, lctx->rfc1964_kd.ctx_key.data,
++				lctx->rfc1964_kd.ctx_key.length))
++			goto out_err;
++	} else {
++		if (lctx->cfx_kd.have_acceptor_subkey) {
++			if (write_bytes(&p, end,
++					lctx->cfx_kd.acceptor_subkey.data,
++					lctx->cfx_kd.acceptor_subkey.length))
++				goto out_err;
++		} else {
++			if (write_bytes(&p, end, lctx->cfx_kd.ctx_key.data,
++					lctx->cfx_kd.ctx_key.length))
++				goto out_err;
++		}
++	}
++
++	buf->length = p - (char *)buf->value;
++	return 0;
++
++out_err:
++	printerr(0, "ERROR: %s: failed serializing krb5 context for kernel\n",
++		 __FUNCTION__);
++	if (buf->value) {
++		free(buf->value);
++		buf->value = NULL;
++	}
++	buf->length = 0;
+ 	return -1;
+ }
+ 
+@@ -176,7 +264,7 @@ serialize_krb5_ctx(gss_ctx_id_t ctx, gss_buffer_desc *buf, int32_t *endtime)
+ 	gss_krb5_lucid_context_v1_t *lctx = 0;
+ 	int retcode = 0;
+ 
+-	printerr(2, "DEBUG: serialize_krb5_ctx: lucid version!\n");
++	printerr(2, "DEBUG: %s: lucid version!\n", __FUNCTION__);
+ 	maj_stat = gss_export_lucid_sec_context(&min_stat, &ctx,
+ 						1, &return_ctx);
+ 	if (maj_stat != GSS_S_COMPLETE) {
+@@ -198,11 +286,20 @@ serialize_krb5_ctx(gss_ctx_id_t ctx, gss_buffer_desc *buf, int32_t *endtime)
+ 		break;
+ 	}
+ 
+-	/* Now lctx points to a lucid context that we can send down to kernel */
+-	if (lctx->protocol == 0)
++	/*
++	 * Now lctx points to a lucid context that we can send down to kernel
++	 *
++	 * Note: we send down different information to the kernel depending
++	 * on the protocol version and the enctyption type.
++	 * For protocol version 0 with all enctypes besides DES3, we use
++	 * the original format.  For protocol version != 0 or DES3, we
++	 * send down the new style information.
++	 */
++
++	if (lctx->protocol == 0 && lctx->rfc1964_kd.ctx_key.type <= 4)
+ 		retcode = prepare_krb5_rfc1964_buffer(lctx, buf, endtime);
+ 	else
+-		retcode = prepare_krb5_rfc_cfx_buffer(lctx, buf, endtime);
++		retcode = prepare_krb5_rfc4121_buffer(lctx, buf, endtime);
+ 
+ 	maj_stat = gss_free_lucid_sec_context(&min_stat, ctx, return_ctx);
+ 	if (maj_stat != GSS_S_COMPLETE) {
+@@ -212,8 +309,8 @@ serialize_krb5_ctx(gss_ctx_id_t ctx, gss_buffer_desc *buf, int32_t *endtime)
+ 	}
+ 
+ 	if (retcode) {
+-		printerr(1, "serialize_krb5_ctx: prepare_krb5_*_buffer "
+-			 "failed (retcode = %d)\n", retcode);
++		printerr(1, "%s: prepare_krb5_*_buffer failed (retcode = %d)\n",
++			 __FUNCTION__, retcode);
+ 		goto out_err;
+ 	}
+ 
+@@ -223,4 +320,7 @@ out_err:
+ 	printerr(0, "ERROR: failed serializing krb5 context for kernel\n");
+ 	return -1;
+ }
++
++
++
+ #endif /* HAVE_LUCID_CONTEXT_SUPPORT */
+diff --git a/utils/gssd/context_mit.c b/utils/gssd/context_mit.c
+index 709a903..f9cbb02 100644
+--- a/utils/gssd/context_mit.c
++++ b/utils/gssd/context_mit.c
+@@ -1,5 +1,5 @@
+ /*
+-  Copyright (c) 2004 The Regents of the University of Michigan.
++  Copyright (c) 2004-2006 The Regents of the University of Michigan.
+   All rights reserved.
+ 
+   Redistribution and use in source and binary forms, with or without
+@@ -38,6 +38,7 @@
+ #include <stdio.h>
+ #include <syslog.h>
+ #include <string.h>
++#include <errno.h>
+ #include <gssapi/gssapi.h>
+ #include <rpc/rpc.h>
+ #include <rpc/auth_gss.h>
+@@ -52,8 +53,7 @@
+ /* XXX argggg, there's gotta be a better way than just duplicating this
+  * whole struct.  Unfortunately, this is in a "private" header file,
+  * so this is our best choice at this point :-/
+- *
+- * XXX Does this match the Heimdal definition?  */
++ */
+ 
+ typedef struct _krb5_gss_ctx_id_rec {
+    unsigned int initiate : 1;   /* nonzero if initiating, zero if accepting */
+@@ -156,50 +156,120 @@ serialize_krb5_ctx(gss_ctx_id_t ctx, gss_buffer_desc *buf, int32_t *endtime)
+ {
+ 	krb5_gss_ctx_id_t kctx = ((gss_union_ctx_id_t)ctx)->internal_ctx_id;
+ 	char *p, *end;
+-	static int constant_one = 1;
+ 	static int constant_zero = 0;
++	static int constant_one = 1;
++	static int constant_two = 2;
+ 	uint32_t word_seq_send;
++	u_int64_t seq_send_64bit;
++	uint32_t v2_flags = 0;
+ 
+ 	if (!(buf->value = calloc(1, MAX_CTX_LEN)))
+ 		goto out_err;
+ 	p = buf->value;
+ 	end = buf->value + MAX_CTX_LEN;
+ 
+-	if (kctx->initiate) {
+-		if (WRITE_BYTES(&p, end, constant_one)) goto out_err;
+-	}
+-	else {
+-		if (WRITE_BYTES(&p, end, constant_zero)) goto out_err;
+-	}
+-	if (kctx->seed_init) {
+-		if (WRITE_BYTES(&p, end, constant_one)) goto out_err;
+-	}
+-	else {
+-		if (WRITE_BYTES(&p, end, constant_zero)) goto out_err;
+-	}
+-	if (write_bytes(&p, end, &kctx->seed, sizeof(kctx->seed)))
++	switch (kctx->enc->enctype) {
++	case ENCTYPE_DES_CBC_CRC:
++	case ENCTYPE_DES_CBC_MD4:
++	case ENCTYPE_DES_CBC_MD5:
++	case ENCTYPE_DES_CBC_RAW:
++		/* Old format of context to the kernel */
++		if (kctx->initiate) {
++			if (WRITE_BYTES(&p, end, constant_one)) goto out_err;
++		}
++		else {
++			if (WRITE_BYTES(&p, end, constant_zero)) goto out_err;
++		}
++		if (kctx->seed_init) {
++			if (WRITE_BYTES(&p, end, constant_one)) goto out_err;
++		}
++		else {
++			if (WRITE_BYTES(&p, end, constant_zero)) goto out_err;
++		}
++		if (write_bytes(&p, end, &kctx->seed, sizeof(kctx->seed)))
++			goto out_err;
++		if (WRITE_BYTES(&p, end, kctx->signalg)) goto out_err;
++		if (WRITE_BYTES(&p, end, kctx->sealalg)) goto out_err;
++		if (WRITE_BYTES(&p, end, kctx->endtime)) goto out_err;
++		word_seq_send = kctx->seq_send;
++		if (WRITE_BYTES(&p, end, word_seq_send)) goto out_err;
++		if (write_oid(&p, end, kctx->mech_used)) goto out_err;
++
++		printerr(2, "serialize_krb5_ctx: serializing keys with "
++			 "enctype %d and length %d\n",
++			 kctx->enc->enctype, kctx->enc->length);
++
++		if (write_keyblock(&p, end, kctx->enc)) goto out_err;
++		if (write_keyblock(&p, end, kctx->seq)) goto out_err;
++		break;
++	case ENCTYPE_DES3_CBC_RAW:
++	case ENCTYPE_DES3_CBC_SHA1:
++	case ENCTYPE_ARCFOUR_HMAC:
++	case ENCTYPE_ARCFOUR_HMAC_EXP:
++	case ENCTYPE_AES128_CTS_HMAC_SHA1_96:
++	case ENCTYPE_AES256_CTS_HMAC_SHA1_96:
++		/* New format of context to the kernel */
++		/* u32 flags;
++		 * #define KRB5_CTX_FLAG_INITIATOR        0x00000001
++		 * #define KRB5_CTX_FLAG_CFX              0x00000002
++		 * #define KRB5_CTX_FLAG_ACCEPTOR_SUBKEY  0x00000004
++		 * s32 endtime;
++		 * u64 seq_send;
++		 * u32  enctype;
++		 * rawkey data
++		 */
++
++		if (kctx->initiate)
++			v2_flags |= KRB5_CTX_FLAG_INITIATOR;
++		if (kctx->proto == 1)
++			v2_flags |= KRB5_CTX_FLAG_CFX;
++		if (kctx->have_acceptor_subkey)
++			v2_flags |= KRB5_CTX_FLAG_ACCEPTOR_SUBKEY;
++		if (WRITE_BYTES(&p, end, v2_flags)) goto out_err;
++		if (WRITE_BYTES(&p, end, kctx->endtime)) goto out_err;
++
++		seq_send_64bit = kctx->seq_send;
++		if (WRITE_BYTES(&p, end, seq_send_64bit)) goto out_err;
++
++		if (kctx->have_acceptor_subkey) {
++			if (WRITE_BYTES(&p, end, kctx->acceptor_subkey->enctype))
++				goto out_err;
++			printerr(2, "serialize_krb5_ctx: serializing subkey "
++				 "with enctype %d and size %d\n",
++				 kctx->acceptor_subkey->enctype,
++				 kctx->acceptor_subkey->length);
++
++			if (write_bytes(&p, end,
++					kctx->acceptor_subkey->contents,
++					kctx->acceptor_subkey->length))
++				goto out_err;
++		} else {
++			if (WRITE_BYTES(&p, end, kctx->enc->enctype))
++				goto out_err;
++			printerr(2, "serialize_krb5_ctx: serializing key "
++				 "with enctype %d and size %d\n",
++				 kctx->enc->enctype, kctx->enc->length);
++
++			if (write_bytes(&p, end, kctx->enc->contents,
++					kctx->enc->length))
++				goto out_err;
++		}
++		break;
++	default:
++		printerr(0, "ERROR: serialize_krb5_ctx: unsupported encryption "
++			 "algorithm %d\n", kctx->enc->enctype);
+ 		goto out_err;
+-	if (WRITE_BYTES(&p, end, kctx->signalg)) goto out_err;
+-	if (WRITE_BYTES(&p, end, kctx->sealalg)) goto out_err;
+-	if (WRITE_BYTES(&p, end, kctx->endtime)) goto out_err;
+-	if (endtime)
+-		*endtime = kctx->endtime;
+-	word_seq_send = kctx->seq_send;
+-	if (WRITE_BYTES(&p, end, word_seq_send)) goto out_err;
+-	if (write_oid(&p, end, kctx->mech_used)) goto out_err;
+-
+-	printerr(2, "serialize_krb5_ctx: serializing keys with "
+-		 "enctype %d and length %d\n",
+-		 kctx->enc->enctype, kctx->enc->length);
+-
+-	if (write_keyblock(&p, end, kctx->enc)) goto out_err;
+-	if (write_keyblock(&p, end, kctx->seq)) goto out_err;
++	}
+ 
+ 	buf->length = p - (char *)buf->value;
+ 	return 0;
++
+ out_err:
+ 	printerr(0, "ERROR: failed serializing krb5 context for kernel\n");
+-	if (buf->value) free(buf->value);
++	if (buf->value) {
++		free(buf->value);
++	}
++	buf->value = NULL;
+ 	buf->length = 0;
+ 	return -1;
+ }
+diff --git a/utils/gssd/gssd_proc.c b/utils/gssd/gssd_proc.c
+index be4fb11..a55418b 100644
+--- a/utils/gssd/gssd_proc.c
++++ b/utils/gssd/gssd_proc.c
+@@ -600,6 +600,67 @@ update_client_list(void)
+ 	return retval;
+ }
+ 
++/* Encryption types supported by the kernel rpcsec_gss code */
++int num_krb5_enctypes = 0;
++krb5_enctype *krb5_enctypes = NULL;
++
++/*
++ * Parse the supported encryption type information
++ */
++static int
++parse_enctypes(char *enctypes)
++{
++	int n = 0;
++	char *curr, *comma;
++	int i;
++	static char *cached_types;
++
++	if (cached_types && strcmp(cached_types, enctypes) == 0)
++		return 0;
++	free(cached_types);
++
++	if (krb5_enctypes != NULL) {
++		free(krb5_enctypes);
++		krb5_enctypes = NULL;
++		num_krb5_enctypes = 0;
++	}
++
++	/* count the number of commas */
++	for (curr = enctypes; curr && *curr != '\0'; curr = ++comma) {
++		comma = strchr(curr, ',');
++		if (comma != NULL)
++			n++;
++		else
++			break;
++	}
++	/* If no more commas and we're not at the end, there's one more value */
++	if (*curr != '\0')
++		n++;
++
++	/* Empty string, return an error */
++	if (n == 0)
++		return ENOENT;
++
++	/* Allocate space for enctypes array */
++	if ((krb5_enctypes = (int *) calloc(n, sizeof(int))) == NULL) {
++		return ENOMEM;
++	}
++
++	/* Now parse each value into the array */
++	for (curr = enctypes, i = 0; curr && *curr != '\0'; curr = ++comma) {
++		krb5_enctypes[i++] = atoi(curr);
++		comma = strchr(curr, ',');
++		if (comma == NULL)
++			break;
++	}
++
++	num_krb5_enctypes = n;
++	if ((cached_types = malloc(strlen(enctypes)+1)))
++		strcpy(cached_types, enctypes);
++
++	return 0;
++}
++
+ static int
+ do_downcall(int k5_fd, uid_t uid, struct authgss_private_data *pd,
+ 	    gss_buffer_desc *context_token)
+@@ -1133,6 +1194,7 @@ handle_gssd_upcall(struct clnt_info *clp)
+ 	char			*mech = NULL;
+ 	char			*target = NULL;
+ 	char			*service = NULL;
++	char			*enctypes = NULL;
+ 
+ 	printerr(1, "handling gssd upcall (%s)\n", clp->dirname);
+ 
+@@ -1176,6 +1238,23 @@ handle_gssd_upcall(struct clnt_info *clp)
+ 		goto out;
+ 	}
+ 
++	/* read supported encryption types if supplied */
++	if ((p = strstr(lbuf, "enctypes=")) != NULL) {
++		enctypes = malloc(lbuflen);
++		if (!enctypes)
++			goto out;
++		if (sscanf(p, "enctypes=%s", enctypes) != 1) {
++			printerr(0, "WARNING: handle_gssd_upcall: "
++				    "failed to parse target name "
++				    "in upcall string '%s'\n", lbuf);
++			goto out;
++		}
++		if (parse_enctypes(enctypes) != 0) {
++			printerr(0, "WARNING: handle_gssd_upcall: "
++				"parsing encryption types failed: errno %d\n", errno);
++		}
++	}
++
+ 	/* read target name */
+ 	if ((p = strstr(lbuf, "target=")) != NULL) {
+ 		target = malloc(lbuflen);
+@@ -1222,6 +1301,7 @@ handle_gssd_upcall(struct clnt_info *clp)
+ out:
+ 	free(lbuf);
+ 	free(mech);
++	free(enctypes);
+ 	free(target);
+ 	free(service);
+ 	return;	
+diff --git a/utils/gssd/krb5_util.c b/utils/gssd/krb5_util.c
+index 1295f57..dccbeb6 100644
+--- a/utils/gssd/krb5_util.c
++++ b/utils/gssd/krb5_util.c
+@@ -292,61 +292,6 @@ gssd_find_existing_krb5_ccache(uid_t uid, char *dirname, struct dirent **d)
+ 	return err;
+ }
+ 
+-
+-#ifdef HAVE_SET_ALLOWABLE_ENCTYPES
+-/*
+- * this routine obtains a credentials handle via gss_acquire_cred()
+- * then calls gss_krb5_set_allowable_enctypes() to limit the encryption
+- * types negotiated.
+- *
+- * XXX Should call some function to determine the enctypes supported
+- * by the kernel. (Only need to do that once!)
+- *
+- * Returns:
+- *	0 => all went well
+- *     -1 => there was an error
+- */
+-
+-int
+-limit_krb5_enctypes(struct rpc_gss_sec *sec, uid_t uid)
+-{
+-	u_int maj_stat, min_stat;
+-	gss_cred_id_t credh;
+-	gss_OID_set_desc  desired_mechs;
+-	krb5_enctype enctypes[] = { ENCTYPE_DES_CBC_CRC,
+-				    ENCTYPE_DES_CBC_MD5,
+-				    ENCTYPE_DES_CBC_MD4 };
+-	int num_enctypes = sizeof(enctypes) / sizeof(enctypes[0]);
+-
+-	/* We only care about getting a krb5 cred */
+-	desired_mechs.count = 1;
+-	desired_mechs.elements = &krb5oid;
+-
+-	maj_stat = gss_acquire_cred(&min_stat, NULL, 0,
+-				    &desired_mechs, GSS_C_INITIATE,
+-				    &credh, NULL, NULL);
+-
+-	if (maj_stat != GSS_S_COMPLETE) {
+-		if (get_verbosity() > 0)
+-			pgsserr("gss_acquire_cred",
+-				maj_stat, min_stat, &krb5oid);
+-		return -1;
+-	}
+-
+-	maj_stat = gss_set_allowable_enctypes(&min_stat, credh, &krb5oid,
+-					     num_enctypes, &enctypes);
+-	if (maj_stat != GSS_S_COMPLETE) {
+-		pgsserr("gss_set_allowable_enctypes",
+-			maj_stat, min_stat, &krb5oid);
+-		gss_release_cred(&min_stat, &credh);
+-		return -1;
+-	}
+-	sec->cred = credh;
+-
+-	return 0;
+-}
+-#endif	/* HAVE_SET_ALLOWABLE_ENCTYPES */
+-
+ /*
+  * Obtain credentials via a key in the keytab given
+  * a keytab handle and a gssd_k5_kt_princ structure.
+@@ -1304,3 +1249,68 @@ gssd_k5_get_default_realm(char **def_realm)
+ 
+ 	krb5_free_context(context);
+ }
++
++#ifdef HAVE_SET_ALLOWABLE_ENCTYPES
++/*
++ * this routine obtains a credentials handle via gss_acquire_cred()
++ * then calls gss_krb5_set_allowable_enctypes() to limit the encryption
++ * types negotiated.
++ *
++ * XXX Should call some function to determine the enctypes supported
++ * by the kernel. (Only need to do that once!)
++ *
++ * Returns:
++ *	0 => all went well
++ *     -1 => there was an error
++ */
++
++int
++limit_krb5_enctypes(struct rpc_gss_sec *sec, uid_t uid)
++{
++	u_int maj_stat, min_stat;
++	gss_cred_id_t credh;
++	gss_OID_set_desc  desired_mechs;
++	krb5_enctype enctypes[] = { ENCTYPE_DES_CBC_CRC,
++				    ENCTYPE_DES_CBC_MD5,
++				    ENCTYPE_DES_CBC_MD4 };
++	int num_enctypes = sizeof(enctypes) / sizeof(enctypes[0]);
++	extern int num_krb5_enctypes;
++	extern krb5_enctype *krb5_enctypes;
++
++	/* We only care about getting a krb5 cred */
++	desired_mechs.count = 1;
++	desired_mechs.elements = &krb5oid;
++
++	maj_stat = gss_acquire_cred(&min_stat, NULL, 0,
++				    &desired_mechs, GSS_C_INITIATE,
++				    &credh, NULL, NULL);
++
++	if (maj_stat != GSS_S_COMPLETE) {
++		if (get_verbosity() > 0)
++			pgsserr("gss_acquire_cred",
++				maj_stat, min_stat, &krb5oid);
++		return -1;
++	}
++
++	/*
++	 * If we failed for any reason to produce global
++	 * list of supported enctypes, use local default here.
++	 */
++	if (krb5_enctypes == NULL)
++		maj_stat = gss_set_allowable_enctypes(&min_stat, credh,
++					&krb5oid, num_enctypes, enctypes);
++	else
++		maj_stat = gss_set_allowable_enctypes(&min_stat, credh,
++					&krb5oid, num_krb5_enctypes, krb5_enctypes);
++
++	if (maj_stat != GSS_S_COMPLETE) {
++		pgsserr("gss_set_allowable_enctypes",
++			maj_stat, min_stat, &krb5oid);
++		gss_release_cred(&min_stat, &credh);
++		return -1;
++	}
++	sec->cred = credh;
++
++	return 0;
++}
++#endif	/* HAVE_SET_ALLOWABLE_ENCTYPES */

@@ -1,0 +1,122 @@
+commit 1ceed81312c2b5289818970953d699023d8d551b
+Author: Steve Dickson <steved@redhat.com>
+Date:   Thu Jun 3 12:44:01 2010 -0400
+
+    mount.nfs: silently fails when the network protocol is not found
+    
+    mount.nfs should display some type of error diagnostics when
+    the network protocol can not be determined.
+    
+    Signed-off-by: Steve Dickson <steved@redhat.com>
+
+diff --git a/utils/mount/network.c b/utils/mount/network.c
+index b08ce80..7c28869 100644
+--- a/utils/mount/network.c
++++ b/utils/mount/network.c
+@@ -1312,6 +1312,8 @@ nfs_nfs_protocol(struct mount_options *options, unsigned long *protocol)
+ 		if (option != NULL) {
+ 			if (!nfs_get_proto(option, &family, protocol)) {
+ 				errno = EPROTONOSUPPORT;
++				nfs_error(_("%s: Failed to find '%s' protocol"), 
++					progname, option);
+ 				return 0;
+ 			}
+ 			return 1;
+@@ -1401,8 +1403,13 @@ int nfs_nfs_proto_family(struct mount_options *options,
+ 	case 2: /* proto */
+ 		option = po_get(options, "proto");
+ 		if (option != NULL &&
+-		    !nfs_get_proto(option, &tmp_family, &protocol))
+-			goto out_err;
++		    !nfs_get_proto(option, &tmp_family, &protocol)) {
++
++			nfs_error(_("%s: Failed to find '%s' protocol"), 
++				progname, option);
++			errno = EPROTONOSUPPORT;
++			return 0;
++		}
+ 	}
+ 
+ 	if (!nfs_verify_family(tmp_family))
+@@ -1495,6 +1502,8 @@ nfs_mount_protocol(struct mount_options *options, unsigned long *protocol)
+ 	option = po_get(options, "mountproto");
+ 	if (option != NULL) {
+ 		if (!nfs_get_proto(option, &family, protocol)) {
++			nfs_error(_("%s: Failed to find '%s' protocol"), 
++				progname, option);
+ 			errno = EPROTONOSUPPORT;
+ 			return 0;
+ 		}
+@@ -1556,10 +1565,16 @@ int nfs_mount_proto_family(struct mount_options *options,
+ 
+ 	option = po_get(options, "mountproto");
+ 	if (option != NULL) {
+-		if (!nfs_get_proto(option, &tmp_family, &protocol))
+-			goto out_err;
+-		if (!nfs_verify_family(tmp_family))
+-			goto out_err;
++		if (!nfs_get_proto(option, &tmp_family, &protocol)) {
++			nfs_error(_("%s: Failed to find '%s' protocol"), 
++				progname, option);
++			errno = EPROTONOSUPPORT;
++			return 0;
++		}
++		if (!nfs_verify_family(tmp_family)) {
++			errno = EAFNOSUPPORT;
++			return 0;
++		}
+ 		*family = tmp_family;
+ 		return 1;
+ 	}
+@@ -1571,9 +1586,6 @@ int nfs_mount_proto_family(struct mount_options *options,
+ 	 * NFS.
+ 	 */
+ 	return nfs_nfs_proto_family(options, family);
+-out_err:
+-	errno = EAFNOSUPPORT;
+-	return 0;
+ }
+ 
+ /**
+diff --git a/utils/mount/stropts.c b/utils/mount/stropts.c
+index 98557d2..0241400 100644
+--- a/utils/mount/stropts.c
++++ b/utils/mount/stropts.c
+@@ -538,7 +538,10 @@ nfs_rewrite_pmap_mount_options(struct mount_options *options)
+ 
+ 	if (!nfs_construct_new_options(options, nfs_saddr, &nfs_pmap,
+ 					mnt_saddr, &mnt_pmap)) {
+-		errno = EINVAL;
++		if (rpc_createerr.cf_stat == RPC_UNKNOWNPROTO)
++			errno = EPROTONOSUPPORT;
++		else
++			errno = EINVAL;
+ 		return 0;
+ 	}
+ 
+@@ -586,18 +589,21 @@ static int nfs_do_mount_v3v2(struct nfsmount_info *mi,
+ 		errno = ENOMEM;
+ 		return result;
+ 	}
+-
++	errno = 0;
+ 	if (!nfs_append_addr_option(sap, salen, options)) {
+-		errno = EINVAL;
++		if (errno == 0)
++			errno = EINVAL;
+ 		goto out_fail;
+ 	}
+ 
+ 	if (!nfs_fix_mounthost_option(options, mi->hostname)) {
+-		errno = EINVAL;
++		if (errno == 0)
++			errno = EINVAL;
+ 		goto out_fail;
+ 	}
+ 	if (!mi->fake && !nfs_verify_lock_option(options)) {
+-		errno = EINVAL;
++		if (errno == 0)
++			errno = EINVAL;
+ 		goto out_fail;
+ 	}
+ 

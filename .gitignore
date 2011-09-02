@@ -1,0 +1,7 @@
+nfs.sysconfig
+rpcsvcgssd.init
+rpcgssd.init
+rpcidmapd.init
+nfslock.init
+nfs.init
+nfs-utils-1.2.2.tar.bz2

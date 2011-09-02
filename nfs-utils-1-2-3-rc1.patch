@@ -1,0 +1,593 @@
+diff --git a/configure.ac b/configure.ac
+index b7520d8..518b6d8 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -81,7 +81,7 @@ AC_ARG_ENABLE(nfsv41,
+ 	if test "$enable_nfsv41" = yes; then
+ 		AC_DEFINE(NFS41_SUPPORTED, 1, [Define this if you want NFSv41 support compiled in])
+ 	else
+-		enable_nfsv4=
++		enable_nfsv41=
+ 	fi
+ 	AC_SUBST(enable_nfsv41)
+ 	AM_CONDITIONAL(CONFIG_NFSV41, [test "$enable_nfsv41" = "yes"])
+diff --git a/support/export/client.c b/support/export/client.c
+index 6236561..5e937b0 100644
+--- a/support/export/client.c
++++ b/support/export/client.c
+@@ -28,6 +28,8 @@
+ #if !defined(__GLIBC__) || __GLIBC__ < 2
+ extern int	innetgr(char *netgr, char *host, char *, char *);
+ #endif
++
++static char	*add_name(char *old, const char *add);
+ static void	client_init(nfs_client *clp, const char *hname,
+ 					struct hostent *hp);
+ static int	client_checkaddr(nfs_client *clp, struct in_addr addr);
+@@ -211,28 +213,6 @@ client_freeall(void)
+ 	}
+ }
+ 
+-nfs_client *
+-client_find(struct hostent *hp)
+-{
+-	nfs_client	*clp;
+-	int		i;
+-
+-	for (i = 0; i < MCL_MAXTYPES; i++) {
+-		for (clp = clientlist[i]; clp; clp = clp->m_next) {
+-			if (!client_check(clp, hp))
+-				continue;
+-#ifdef notdef
+-			if (clp->m_type == MCL_FQDN)
+-				return clp;
+-			return client_dup(clp, hp);
+-#else
+-			return clp;
+-#endif
+-		}
+-	}
+-	return NULL;
+-}
+-
+ struct hostent *
+ client_resolve(struct in_addr addr)
+ {
+@@ -246,14 +226,18 @@ client_resolve(struct in_addr addr)
+ 	return he;
+ }
+ 
+-/*
+- * Find client name given an IP address
+- * This is found by gathering all known names that match that IP address,
+- * sorting them and joining them with '+'
++/**
++ * client_compose - Make a list of cached hostnames that match an IP address
++ * @he: pointer to hostent containing IP address information to match
+  *
++ * Gather all known client hostnames that match the IP address, and sort
++ * the result into a comma-separated list.
++ *
++ * Returns a '\0'-terminated ASCII string containing a comma-separated
++ * sorted list of client hostnames, or NULL if no client records matched
++ * the IP address or memory could not be allocated.  Caller must free the
++ * returned string with free(3).
+  */
+-static char *add_name(char *old, char *add);
+-
+ char *
+ client_compose(struct hostent *he)
+ {
+@@ -271,13 +255,19 @@ client_compose(struct hostent *he)
+ 	return name;
+ }
+ 
++/**
++ * client_member - check if @name is contained in the list @client
++ * @client: '\0'-terminated ASCII string containing
++ *		comma-separated list of hostnames
++ * @name: '\0'-terminated ASCII string containing hostname to look for
++ *
++ * Returns 1 if @name was found in @client, otherwise zero is returned.
++ */
+ int
+-client_member(char *client, char *name)
++client_member(const char *client, const char *name)
+ {
+-	/* check if "client" (a ',' separated list of names)
+-	 * contains 'name' as a member
+-	 */
+-	int l = strlen(name);
++	size_t l = strlen(name);
++
+ 	while (*client) {
+ 		if (strncmp(client, name, l) == 0 &&
+ 		    (client[l] == ',' || client[l] == '\0'))
+@@ -290,9 +280,8 @@ client_member(char *client, char *name)
+ 	return 0;
+ }
+ 
+-
+-int
+-name_cmp(char *a, char *b)
++static int
++name_cmp(const char *a, const char *b)
+ {
+ 	/* compare strings a and b, but only upto ',' in a */
+ 	while (*a && *b && *a != ',' && *a == *b)
+@@ -305,9 +294,9 @@ name_cmp(char *a, char *b)
+ }
+ 
+ static char *
+-add_name(char *old, char *add)
++add_name(char *old, const char *add)
+ {
+-	int len = strlen(add)+2;
++	size_t len = strlen(add) + 2;
+ 	char *new;
+ 	char *cp;
+ 	if (old) len += strlen(old);
+diff --git a/support/export/export.c b/support/export/export.c
+index 2943466..42e78f6 100644
+--- a/support/export/export.c
++++ b/support/export/export.c
+@@ -128,6 +128,7 @@ export_dup(nfs_export *exp, struct hostent *hp)
+ 
+ 	return new;
+ }
++
+ /*
+  * Add export entry to hash table
+  */
+@@ -276,15 +277,15 @@ export_freeall(void)
+ 			if (exp->m_export.e_mountpoint)
+ 				free(exp->m_export.e_mountpoint);
+ 			if (exp->m_export.e_fslocdata)
+-				xfree(exp->m_export.e_fslocdata);
++				free(exp->m_export.e_fslocdata);
+ 			xfree(exp->m_export.e_hostname);
+ 			xfree(exp);
+ 		}
+-      for(j = 0; j < HASH_TABLE_SIZE; j++) {
+-        exportlist[i].entries[j].p_first = NULL;
+-        exportlist[i].entries[j].p_last = NULL;
+-      }
+-      exportlist[i].p_head = NULL;
++		for (j = 0; j < HASH_TABLE_SIZE; j++) {
++			exportlist[i].entries[j].p_first = NULL;
++			exportlist[i].entries[j].p_last = NULL;
++		}
++		exportlist[i].p_head = NULL;
+ 	}
+ 	client_freeall();
+ }
+diff --git a/support/include/exportfs.h b/support/include/exportfs.h
+index 470b2ec..9a19cbb 100644
+--- a/support/include/exportfs.h
++++ b/support/include/exportfs.h
+@@ -69,17 +69,16 @@ extern exp_hash_table exportlist[MCL_MAXTYPES];
+ extern nfs_client *		clientlist[MCL_MAXTYPES];
+ 
+ nfs_client *			client_lookup(char *hname, int canonical);
+-nfs_client *			client_find(struct hostent *);
+ void				client_add(nfs_client *);
+ nfs_client *			client_dup(nfs_client *, struct hostent *);
+ int				client_gettype(char *hname);
+ int				client_check(nfs_client *, struct hostent *);
+-int				client_match(nfs_client *, char *hname);
+ void				client_release(nfs_client *);
+ void				client_freeall(void);
+ char *				client_compose(struct hostent *he);
+ struct hostent *		client_resolve(struct in_addr addr);
+-int 				client_member(char *client, char *name);
++int 				client_member(const char *client,
++						const char *name);
+ 
+ int				export_read(char *fname);
+ void			export_add(nfs_export *);
+diff --git a/support/include/nfsrpc.h b/support/include/nfsrpc.h
+index 4db35ab..6ebefca 100644
+--- a/support/include/nfsrpc.h
++++ b/support/include/nfsrpc.h
+@@ -160,4 +160,7 @@ extern int		nfs_rpc_ping(const struct sockaddr *sap,
+ 				const unsigned short protocol,
+ 				const struct timeval *timeout);
+ 
++/* create AUTH_SYS handle with no supplemental groups */
++extern AUTH *			 nfs_authsys_create(void);
++
+ #endif	/* !__NFS_UTILS_NFSRPC_H */
+diff --git a/support/nfs/cacheio.c b/support/nfs/cacheio.c
+index bdf5d84..0587ecb 100644
+--- a/support/nfs/cacheio.c
++++ b/support/nfs/cacheio.c
+@@ -148,6 +148,11 @@ void qword_printint(FILE *f, int num)
+ 	fprintf(f, "%d ", num);
+ }
+ 
++void qword_printuint(FILE *f, unsigned int num)
++{
++	fprintf(f, "%u ", num);
++}
++
+ int qword_eol(FILE *f)
+ {
+ 	int err;
+@@ -236,6 +241,20 @@ int qword_get_int(char **bpp, int *anint)
+ 	return 0;
+ }
+ 
++int qword_get_uint(char *bpp, unsigned int *anint)
++{
++	char buf[50];
++	char *ep;
++	unsigned int rv;
++	int len = qword_get(bpp, buf, 50);
++	if (len < 0) return -1;
++	if (len ==0) return -1;
++	rv = strtoul(buf, &ep, 0);
++	if (*ep) return -1;
++	*anint = rv;
++	return 0;
++}
++
+ #define READLINE_BUFFER_INCREMENT 2048
+ 
+ int readline(int fd, char **buf, int *lenp)
+diff --git a/support/nfs/rpc_socket.c b/support/nfs/rpc_socket.c
+index 0e20824..c14efe8 100644
+--- a/support/nfs/rpc_socket.c
++++ b/support/nfs/rpc_socket.c
+@@ -557,3 +557,24 @@ rpcprog_t nfs_getrpcbyname(const rpcprog_t program, const char *table[])
+ 
+ 	return program;
+ }
++
++/*
++ * AUTH_SYS doesn't allow more than 16 gids in the supplemental group list.
++ * If there are more than that, trying to determine which ones to include
++ * in the list is problematic. This function creates an auth handle that
++ * only has the primary gid in the supplemental gids list. It's intended to
++ * be used for protocols where credentials really don't matter much (the MNT
++ * protocol, for instance).
++ */
++AUTH *
++nfs_authsys_create(void)
++{
++	char machname[MAXHOSTNAMELEN + 1];
++	uid_t	uid = geteuid();
++	gid_t	gid = getegid();
++
++	if (gethostname(machname, sizeof(machname)) == -1)
++		return NULL;
++
++	return authunix_create(machname, uid, gid, 1, &gid);
++}
+diff --git a/utils/mount/network.c b/utils/mount/network.c
+index 8dc183a..c541257 100644
+--- a/utils/mount/network.c
++++ b/utils/mount/network.c
+@@ -857,7 +857,14 @@ int nfs_advise_umount(const struct sockaddr *sap, const socklen_t salen,
+ 		return 0;
+ 	}
+ 
+-	client->cl_auth = authunix_create_default();
++	client->cl_auth = nfs_authsys_create();
++	if (client->cl_auth == NULL) {
++		if (verbose)
++			nfs_error(_("%s: Failed to create RPC auth handle"),
++				progname);
++		CLNT_DESTROY(client);
++		return 0;
++	}
+ 
+ 	res = CLNT_CALL(client, MOUNTPROC_UMNT,
+ 			(xdrproc_t)xdr_dirpath, (caddr_t)argp,
+@@ -957,8 +964,10 @@ CLIENT *mnt_openclnt(clnt_addr_t *mnt_server, int *msock)
+ 	}
+ 	if (clnt) {
+ 		/* try to mount hostname:dirname */
+-		clnt->cl_auth = authunix_create_default();
+-		return clnt;
++		clnt->cl_auth = nfs_authsys_create();
++		if (clnt->cl_auth)
++			return clnt;
++		CLNT_DESTROY(clnt);
+ 	}
+ 	return NULL;
+ }
+diff --git a/utils/mount/stropts.c b/utils/mount/stropts.c
+index 9b8c38f..98557d2 100644
+--- a/utils/mount/stropts.c
++++ b/utils/mount/stropts.c
+@@ -799,6 +799,7 @@ static int nfs_is_permanent_error(int error)
+ 	case ESTALE:
+ 	case ETIMEDOUT:
+ 	case ECONNREFUSED:
++	case EHOSTUNREACH:
+ 		return 0;	/* temporary */
+ 	default:
+ 		return 1;	/* permanent */
+diff --git a/utils/mountd/cache.c b/utils/mountd/cache.c
+index d63e10a..6343325 100644
+--- a/utils/mountd/cache.c
++++ b/utils/mountd/cache.c
+@@ -125,7 +125,7 @@ void auth_unix_gid(FILE *f)
+ 	 * reply is
+ 	 *  uid expiry count list of group ids
+ 	 */
+-	int uid;
++	uid_t uid;
+ 	struct passwd *pw;
+ 	gid_t glist[100], *groups = glist;
+ 	int ngroups = 100;
+@@ -136,7 +136,7 @@ void auth_unix_gid(FILE *f)
+ 		return;
+ 
+ 	cp = lbuf;
+-	if (qword_get_int(&cp, &uid) != 0)
++	if (qword_get_uint(&cp, &uid) != 0)
+ 		return;
+ 
+ 	pw = getpwuid(uid);
+@@ -153,14 +153,14 @@ void auth_unix_gid(FILE *f)
+ 						  groups, &ngroups);
+ 		}
+ 	}
+-	qword_printint(f, uid);
+-	qword_printint(f, time(0)+30*60);
++	qword_printuint(f, uid);
++	qword_printuint(f, time(0)+30*60);
+ 	if (rv >= 0) {
+-		qword_printint(f, ngroups);
++		qword_printuint(f, ngroups);
+ 		for (i=0; i<ngroups; i++)
+-			qword_printint(f, groups[i]);
++			qword_printuint(f, groups[i]);
+ 	} else
+-		qword_printint(f, 0);
++		qword_printuint(f, 0);
+ 	qword_eol(f);
+ 
+ 	if (groups != glist)
+@@ -614,12 +614,12 @@ static int dump_to_cache(FILE *f, char *domain, char *path, struct exportent *ex
+ 	return qword_eol(f);
+ }
+ 
+-static int is_subdirectory(char *subpath, char *path)
++static int is_subdirectory(char *child, char *parent)
+ {
+-	int l = strlen(path);
++	int l = strlen(parent);
+ 
+-	return strcmp(subpath, path) == 0
+-		|| (strncmp(subpath, path, l) == 0 && path[l] == '/');
++	return strcmp(child, parent) == 0
++		|| (strncmp(child, parent, l) == 0 && child[l] == '/');
+ }
+ 
+ static int path_matches(nfs_export *exp, char *path)
+diff --git a/utils/showmount/showmount.c b/utils/showmount/showmount.c
+index f567093..394f528 100644
+--- a/utils/showmount/showmount.c
++++ b/utils/showmount/showmount.c
+@@ -194,7 +194,13 @@ int main(int argc, char **argv)
+ 	}
+ 
+ 	mclient = nfs_get_mount_client(hostname, mount_vers_tbl[vers]);
+-	mclient->cl_auth = authunix_create_default();
++	mclient->cl_auth = nfs_authsys_create();
++	if (mclient->cl_auth == NULL) {
++		fprintf(stderr, "%s: unable to create RPC auth handle.\n",
++				program_name);
++		clnt_destroy(mclient);
++		exit(1);
++	}
+ 	total_timeout.tv_sec = TOTAL_TIMEOUT;
+ 	total_timeout.tv_usec = 0;
+ 
+diff --git a/utils/statd/sm-notify.c b/utils/statd/sm-notify.c
+index 3259a3e..437e37a 100644
+--- a/utils/statd/sm-notify.c
++++ b/utils/statd/sm-notify.c
+@@ -54,7 +54,7 @@ struct nsm_host {
+ 	uint32_t		xid;
+ };
+ 
+-static char		nsm_hostname[256];
++static char		nsm_hostname[SM_MAXSTRLEN + 1];
+ static int		nsm_state;
+ static int		nsm_family = AF_INET;
+ static int		opt_debug = 0;
+@@ -412,12 +412,33 @@ usage:		fprintf(stderr,
+ 		}
+ 	}
+ 
+-	if (opt_srcaddr) {
+-		strncpy(nsm_hostname, opt_srcaddr, sizeof(nsm_hostname)-1);
+-	} else
+-	if (gethostname(nsm_hostname, sizeof(nsm_hostname)) < 0) {
+-		xlog(L_ERROR, "Failed to obtain name of local host: %m");
+-		exit(1);
++	if (opt_srcaddr != NULL) {
++		struct addrinfo *ai = NULL;
++		struct addrinfo hint = {
++			.ai_family	= AF_UNSPEC,
++			.ai_flags	= AI_NUMERICHOST,
++		};
++
++		if (getaddrinfo(opt_srcaddr, NULL, &hint, &ai))
++			/* not a presentation address - use it */
++			strncpy(nsm_hostname, opt_srcaddr, sizeof(nsm_hostname));
++		else {
++			/* was a presentation address - look it up in
++			 * /etc/hosts, so it can be used for my_name */
++			int error;
++
++			freeaddrinfo(ai);
++			hint.ai_flags = AI_CANONNAME;
++			error = getaddrinfo(opt_srcaddr, NULL, &hint, &ai);
++			if (error != 0) {
++				xlog(L_ERROR, "Bind address %s is unusable: %s",
++						opt_srcaddr, gai_strerror(error));
++				exit(1);
++			}
++			strncpy(nsm_hostname, ai->ai_canonname,
++							sizeof(nsm_hostname));
++			freeaddrinfo(ai);
++		}
+ 	}
+ 
+ 	(void)nsm_retire_monitored_hosts();
+@@ -535,6 +556,8 @@ notify(const int sock)
+ static int
+ notify_host(int sock, struct nsm_host *host)
+ {
++	const char *my_name = (opt_srcaddr != NULL ?
++					nsm_hostname : host->my_name);
+ 	struct sockaddr *sap;
+ 	socklen_t salen;
+ 
+@@ -580,8 +603,8 @@ notify_host(int sock, struct nsm_host *host)
+ 		host->xid = nsm_xmit_rpcbind(sock, sap, SM_PROG, SM_VERS);
+ 	else
+ 		host->xid = nsm_xmit_notify(sock, sap, salen,
+-				SM_PROG, nsm_hostname, nsm_state);
+-	
++					SM_PROG, my_name, nsm_state);
++
+ 	return 0;
+ }
+ 
+@@ -611,15 +634,28 @@ recv_rpcbind_reply(struct sockaddr *sap, struct nsm_host *host, XDR *xdr)
+ }
+ 
+ /*
+- * Successful NOTIFY call. Server returns void, so nothing
+- * we need to do here.
++ * Successful NOTIFY call. Server returns void.
++ *
++ * Try sending another SM_NOTIFY with an unqualified "my_name"
++ * argument.  Reuse the port number.  If "my_name" is already
++ * unqualified, we're done.
+  */
+ static void
+ recv_notify_reply(struct nsm_host *host)
+ {
+-	xlog(D_GENERAL, "Host %s notified successfully", host->name);
++	char *dot = strchr(host->my_name, '.');
+ 
+-	smn_forget_host(host);
++	if (dot != NULL) {
++		*dot = '\0';
++		host->send_next = time(NULL);
++		host->xid = 0;
++		if (host->timeout >= NSM_MAX_TIMEOUT / 4)
++			host->timeout = NSM_MAX_TIMEOUT / 4;
++		insert_host(host);
++	} else {
++		xlog(D_GENERAL, "Host %s notified successfully", host->name);
++		smn_forget_host(host);
++	}
+ }
+ 
+ /*
+diff --git a/utils/statd/sm-notify.man b/utils/statd/sm-notify.man
+index 163713e..7a1cbfa 100644
+--- a/utils/statd/sm-notify.man
++++ b/utils/statd/sm-notify.man
+@@ -97,11 +97,9 @@ It uses the
+ string as the destination.
+ To identify which host has rebooted, the
+ .B sm-notify
+-command normally sends the results of
+-.BR gethostname (3)
+-as the
++command normally sends
+ .I my_name
+-string.
++string recorded when that remote was monitored.
+ The remote
+ .B rpc.statd
+ matches incoming SM_NOTIFY requests using this string,
+@@ -202,15 +200,22 @@ argument to use when sending SM_NOTIFY requests.
+ If this option is not specified,
+ .B sm-notify
+ uses a wildcard address as the transport bind address,
+-and uses the results of
+-.BR gethostname (3)
+-as the
++and uses the
++.I my_name
++recorded when the remote was monitored as the
+ .I mon_name
+-argument.
++argument when sending SM_NOTIFY requests.
+ .IP
+ The
+ .I ipaddr
+ form can be expressed as either an IPv4 or an IPv6 presentation address.
++If the
++.I ipaddr
++form is used, the
++.B sm-notify
++command converts this address to a hostname for use as the
++.I mon_name
++argument when sending SM_NOTIFY requests.
+ .IP
+ This option can be useful in multi-homed configurations where
+ the remote requires notification from a specific network address.
+@@ -252,13 +257,6 @@ consistent
+ The hostname the client uses to mount the server should match the server's
+ .I mon_name
+ in SM_NOTIFY requests it sends
+-.IP
+-The use of network addresses as a
+-.I mon_name
+-or a
+-.I my_name
+-string should be avoided when
+-interoperating with non-Linux NFS implementations.
+ .PP
+ Unmounting an NFS file system does not necessarily stop
+ either the NFS client or server from monitoring each other.
+diff --git a/utils/statd/statd.man b/utils/statd/statd.man
+index ffc5e95..ca00e24 100644
+--- a/utils/statd/statd.man
++++ b/utils/statd/statd.man
+@@ -100,11 +100,9 @@ It uses the
+ string as the destination.
+ To identify which host has rebooted, the
+ .B sm-notify
+-command normally sends the results of
+-.BR gethostname (3)
+-as the
++command sends the
+ .I my_name
+-string.
++string recorded when that remote was monitored.
+ The remote
+ .B rpc.statd
+ matches incoming SM_NOTIFY requests using this string,
+@@ -292,7 +290,6 @@ man pages.
+ .SH ADDITIONAL NOTES
+ Lock recovery after a reboot is critical to maintaining data integrity
+ and preventing unnecessary application hangs.
+-.PP
+ To help
+ .B rpc.statd
+ match SM_NOTIFY requests to NLM requests, a number of best practices
+@@ -309,13 +306,6 @@ consistent
+ The hostname the client uses to mount the server should match the server's
+ .I mon_name
+ in SM_NOTIFY requests it sends
+-.IP
+-The use of network addresses as a
+-.I mon_name
+-or a
+-.I my_name
+-string should be avoided when
+-interoperating with non-Linux NFS implementations.
+ .PP
+ Unmounting an NFS file system does not necessarily stop
+ either the NFS client or server from monitoring each other.
